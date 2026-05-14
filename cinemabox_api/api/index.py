@@ -1,12 +1,11 @@
 import requests
 import json
-import re
-from fastapi import FastAPI, HTTPException, Depends
+import os
+import time
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional
-from contextlib import asynccontextmanager
-import time
-import os
 
 # -------------------------------
 # إعدادات CinemaBox API
@@ -59,7 +58,7 @@ class ResolveRequest(BaseModel):
     title: str
     original_title: Optional[str] = None
     year: int
-    media_type: str = "movie"   # movie أو tv
+    media_type: str = "movie"
 
 class ResolveResponse(BaseModel):
     episode_id: int
@@ -76,10 +75,10 @@ class EpisodeRequest(BaseModel):
     episode_number: int
 
 # -------------------------------
-# إدارة التوكن (جلسة واحدة للتطبيق)
+# إدارة التوكن
 # -------------------------------
 class CinemaBoxClient:
-    def __init__(self):
+    def init(self):
         self.jwt = None
         self.active_url = BASE_URL
         self.last_login = 0
@@ -88,8 +87,8 @@ class CinemaBoxClient:
         if self.jwt and (time.time() - self.last_login) < 3600:
             return
         payload = {
-            "username_or_email": os.getenv("CINEMABOX_EMAIL", "bkrmshtaq79@gmail.com"),
-            "password": os.getenv("CINEMABOX_PASSWORD", "07744080333@@")
+            "username_or_email": os.environ.get("CINEMABOX_EMAIL", "bkrmshtaq79@gmail.com"),
+            "password": os.environ.get("CINEMABOX_PASSWORD", "07744080333@@")
         }
         try:
             resp = self._request("auth/login", method="POST", json=payload, use_auth=False)
@@ -99,7 +98,7 @@ class CinemaBoxClient:
             else:
                 raise Exception("No JWT in response")
         except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Login failed: {str(e)}")
+            raise Exception(f"Login failed: {str(e)}")
     
     def _request(self, endpoint: str, method="GET", json=None, use_auth=True):
         url = self.active_url + endpoint
@@ -108,7 +107,7 @@ class CinemaBoxClient:
             "Content-Type": "application/json",
             "App-Version": APP_VERSION,
             "Accept-Language": "ar",
-            "Device-Id": "fastapi_server",
+            "Device-Id": "vercel_server",
             "Device-Model": "Server",
             "Device-OS-Version": "3",
             "Device-Store": "google"
@@ -122,30 +121,25 @@ class CinemaBoxClient:
             else:
                 r = requests.post(url, headers=headers, json=json, timeout=TIMEOUT)
             
-            # محاولة استخدام السيرفر البديل إذا فشل 503
             if r.status_code == 503 and self.active_url == BASE_URL:
                 self.active_url = BACKUP_URL
                 return self._request(endpoint, method, json, use_auth)
             
             if r.status_code == 401:
-                # التوكن انتهى – حاول إعادة تسجيل الدخول
                 self.jwt = None
                 self.ensure_login()
-                # أعد المحاولة مرة واحدة
                 headers["Authorization"] = self.jwt
                 r = requests.get(url, headers=headers, timeout=TIMEOUT) if method=="GET" else requests.post(url, headers=headers, json=json, timeout=TIMEOUT)
-            
-            if r.status_code >= 400:
+[14/05/2026 05:14 م] Satoru: if r.status_code >= 400:
                 raise Exception(f"HTTP {r.status_code}: {r.text[:200]}")
             
             return r.json()
-        except requests.exceptions.RequestException as e:
-            raise Exception(f"Network error: {str(e)}")
+        except Exception as e:
+            raise Exception(f"Request error: {str(e)}")
     
     def search(self, query: str) -> List[ShowResult]:
         self.ensure_login()
         encoded = requests.utils.quote(query)
-        # استخدام q= بدلاً من query=
         resp = self._request(f"search?q={encoded}")
         results = []
         for item in resp.get("results", []):
@@ -162,7 +156,6 @@ class CinemaBoxClient:
     def get_stream(self, episode_id: int) -> MediaResult:
         self.ensure_login()
         data = self._request(f"shows/episodes/player/{episode_id}")
-        # استخراج الفيديوهات
         videos = []
         for v in data.get("videos", []):
             videos.append(StreamVideo(quality=v.get("quality", "auto"), url=v.get("url", "")))
@@ -205,36 +198,41 @@ class CinemaBoxClient:
             data = section.get("data", [])
             if not data:
                 continue
-            # التحقق من أن data تحتوي على حلقات
             season_counter += 1
             if season_counter != season_number:
                 continue
-            # المصفوفة مرتبة حسب الحلقات
             idx = episode_number - 1
             if 0 <= idx < len(data):
                 return data[idx].get("id", -1)
         return -1
 
 # -------------------------------
-# تطبيق FastAPI
+# تطبيق FastAPI (لـ Vercel)
 # -------------------------------
+app = FastAPI(title="CinemaBox Proxy API")
+
+# إضافة CORS للسماح لأي تطبيق بالاتصال
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 client = CinemaBoxClient()
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    # عند بدء التشغيل: تسجيل الدخول مسبقاً
+# محاولة تسجيل الدخول عند بدء التشغيل (اختياري)
+@app.on_event("startup")
+async def startup():
     try:
         client.ensure_login()
         print("✅ CinemaBox login successful")
     except Exception as e:
         print(f"⚠️ Initial login failed: {e}")
-    yield
-    # عند الإغلاق لا حاجة لفعل شيء
-
-app = FastAPI(title="CinemaBox Proxy API", lifespan=lifespan)
 
 # -------------------------------
-# Endpoints
+# نقاط النهاية (Endpoints)
 # -------------------------------
 @app.get("/search", response_model=SearchResponse)
 async def search(query: str):
@@ -244,13 +242,10 @@ async def search(query: str):
 @app.get("/stream/{episode_id}", response_model=MediaResult)
 async def get_stream(episode_id: int):
     return client.get_stream(episode_id)
-
-@app.post("/resolve_movie", response_model=ResolveResponse)
+[14/05/2026 05:14 م] Satoru: @app.post("/resolve_movie", response_model=ResolveResponse)
 async def resolve_movie(req: ResolveRequest):
-    # البحث
     query = req.original_title if req.original_title else req.title
     results = client.search(query)
-    # خوارزمية بسيطة لاختيار أفضل نتيجة (نوع MOVIE + أقرب سنة)
     best_show = None
     best_score = -1
     for r in results:
@@ -270,10 +265,9 @@ async def resolve_movie(req: ResolveRequest):
             best_show = r
     if not best_show:
         raise HTTPException(status_code=404, detail=f"No movie found for '{req.title}'")
-    # جلب الحلقات (للأفلام أول id)
+    
     sections = client.get_sections(best_show.id)
     episode_id = -1
-    # استخراج أول episode id
     for sec in sections.get("sections", []):
         for item in sec.get("data", []):
             if item.get("type") == "episode":
@@ -283,11 +277,12 @@ async def resolve_movie(req: ResolveRequest):
             break
     if episode_id == -1:
         raise HTTPException(status_code=404, detail="No episode found for this movie")
+    
     media = client.get_stream(episode_id)
     if not media.videos:
         raise HTTPException(status_code=404, detail="No video streams available")
-    best_quality = media.videos[0]  # افتراض أن الأول هو الأعلى
-    # نبحث عن 1080p أو 720p
+    
+    best_quality = media.videos[0]
     for v in media.videos:
         if "1080" in v.quality:
             best_quality = v
@@ -304,7 +299,6 @@ async def resolve_movie(req: ResolveRequest):
 
 @app.post("/resolve_tv", response_model=ResolveResponse)
 async def resolve_tv(req: EpisodeRequest):
-    # البحث عن المسلسل
     query = req.original_title if req.original_title else req.title
     results = client.search(query)
     best_show = None
@@ -326,13 +320,15 @@ async def resolve_tv(req: EpisodeRequest):
             best_show = r
     if not best_show:
         raise HTTPException(status_code=404, detail=f"No series found for '{req.title}'")
-    # العثور على episode id
+    
     episode_id = client.find_episode_id_by_index(best_show.id, req.season_number, req.episode_number)
     if episode_id == -1:
         raise HTTPException(status_code=404, detail=f"Episode S{req.season_number}E{req.episode_number} not found")
+    
     media = client.get_stream(episode_id)
     if not media.videos:
         raise HTTPException(status_code=404, detail="No video streams available")
+    
     best_quality = media.videos[0]
     for v in media.videos:
         if "1080" in v.quality:
@@ -351,11 +347,3 @@ async def resolve_tv(req: EpisodeRequest):
 @app.get("/health")
 async def health():
     return {"status": "ok", "logged_in": client.jwt is not None}
-
-# -------------------------------
-# تشغيل الخادم
-# -------------------------------
-if __name__ == "__main__":
-    import uvicorn
-    # ضع بيانات الدخول كمتغيرات بيئة أو اكتبها مباشرة (غير آمن)
-    uvicorn.run(app, host="0.0.0.0", port=8000)
